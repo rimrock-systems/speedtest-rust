@@ -3,6 +3,13 @@ bind_address="0.0.0.0"
 # socket listent port, default is 8080
 listen_port=8080
 
+# peers whose `X-Real-IP` / `X-Forwarded-For` headers are honoured, as IP addresses or
+# CIDR ranges, e.g. ["127.0.0.1", "10.0.0.0/8", "::1"]
+# empty (the default) means those headers are ignored and the real peer address is recorded.
+# set this if the server sits behind a reverse proxy, otherwise any client can choose the
+# IP address that is recorded for it
+trusted_proxies=[]
+
 # you can specify the number of worker threads. default is 1
 # auto: number of cpu cores, or more than 0 as desired
 # increasing the count increases memory usage

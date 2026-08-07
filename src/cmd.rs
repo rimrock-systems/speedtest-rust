@@ -6,6 +6,7 @@ pub struct Cmd {
     pub server_config_path : Option<String>,
     pub bind_address : Option<String>,
     pub listen_port : Option<u16>,
+    pub trusted_proxies : Option<Vec<String>>,
     pub base_url : Option<String>,
     pub ipinfo_api_key : Option<String>,
     pub assets_path : Option<String>,
@@ -59,6 +60,13 @@ impl Cmd {
                     .long("listen-port")
                     .help("Listening port")
                     .value_parser(value_parser!(u16))
+            )
+            .arg(
+                Arg::new("trusted-proxies")
+                    .long("trusted-proxies")
+                    .help("Peers whose X-Real-IP / X-Forwarded-For headers are honoured, as IP addresses or CIDR ranges")
+                    .value_delimiter(',')
+                    .value_parser(value_parser!(String))
             )
             .arg(
                 Arg::new("base-url")
@@ -155,6 +163,8 @@ impl Cmd {
         let server_config_path : Option<String> = args.get_one::<String>("server-config-path").map(|s| s.to_owned());
         let bind_address : Option<String> = args.get_one::<String>("bind-address").map(|s| s.to_owned());
         let listen_port : Option<u16> = args.get_one::<u16>("listen-port").map(|s| s.to_owned());
+        let trusted_proxies : Option<Vec<String>> = args.get_many::<String>("trusted-proxies")
+            .map(|values| values.map(|s| s.to_owned()).collect());
         let base_url : Option<String> = args.get_one::<String>("base-url").map(|s| s.to_owned());
         let ipinfo_api_key : Option<String> = args.get_one::<String>("ipinfo-api-key").map(|s| s.to_owned());
         let assets_path : Option<String> = args.get_one::<String>("assets-path").map(|s| s.to_owned());
@@ -175,6 +185,7 @@ impl Cmd {
             server_config_path,
             bind_address,
             listen_port,
+            trusted_proxies,
             base_url,
             ipinfo_api_key,
             assets_path,

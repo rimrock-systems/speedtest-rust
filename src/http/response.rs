@@ -258,6 +258,7 @@ mod tests {
         SERVER_CONFIG.get_or_init(|| ServerConfig {
             bind_address: "0.0.0.0".to_string(),
             listen_port: 8080,
+            trusted_proxies: Vec::new(),
             worker_threads: serde_json::Value::from(1),
             base_url: "test".to_string(),
             ipinfo_api_key: "".to_string(),
