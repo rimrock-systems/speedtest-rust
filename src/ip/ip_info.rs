@@ -128,9 +128,13 @@ impl IPInfo {
             return None
         }
         if let Ok(mut client) = HttpClient::open("https://ipinfo.io").await {
+            //`Connection: close` so a response that arrives without a `Content-Length`
+            //(chunked, or HTTP/1.1 keep-alive by default) still ends at EOF rather than
+            //leaving the read waiting on a connection the server is happy to keep open
             let request = format!(
                 "GET /{}/json?token={} HTTP/1.1\r\n\
-                Host: ipinfo.io\r\n\r\n",
+                Host: ipinfo.io\r\n\
+                Connection: close\r\n\r\n",
                 ip,
                 ip_info_token
             );
