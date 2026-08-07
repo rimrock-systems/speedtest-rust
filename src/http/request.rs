@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use log::trace;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -95,21 +96,11 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
                             }
                         }
                         BodyType::Chunked => {
-                            let mut buffer = [0; 1024];
-                            loop {
-                                let bytes_read = buf_reader.read_exact(&mut buffer).await;
-                                match bytes_read {
-                                    Ok(0) => {
-                                        buffer.fill(0);
-                                        break;
-                                    }
-                                    Ok(_) => {
-                                        buffer.fill(0);
-                                    }
-                                    Err(_) => {
-                                        break;
-                                    }
-                                }
+                            //a body that cannot be framed leaves the reader at an unknown
+                            //position, so close the connection rather than hand what follows
+                            //to the router as if it were the next request
+                            if discard_chunked_body(buf_reader).await.is_err() {
+                                break 'root_loop
                             }
                             None
                         }
@@ -186,12 +177,57 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
     }
 }
 
+/// Consume a `Transfer-Encoding: chunked` request body, following the chunk framing of
+/// RFC 9112 §7.1: a hex chunk-size line (optionally carrying chunk extensions), that many
+/// bytes of data, a CRLF, repeated until a zero-size chunk, then any trailer fields and the
+/// terminating empty line.
+///
+/// The body itself is discarded — no route reads a chunked body — but the framing has to be
+/// followed so the reader stops at the end of the body. Reading fixed-size blocks instead
+/// leaves the request unanswered: the reader waits for bytes that a client which has finished
+/// its body and is holding the connection open will never send.
+async fn discard_chunked_body<R>(buf_reader: &mut BufReader<R>) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin
+{
+    let mut sink = [0u8; 8192];
+    loop {
+        let Some(size_line) = buf_reader.lines().next_line().await? else {
+            return Err(Error::new(ErrorKind::UnexpectedEof,"chunked body ended before its terminating chunk"))
+        };
+        //the chunk-size line may carry `;`-separated chunk extensions
+        let size_field = size_line.split(';').next().unwrap_or("").trim();
+        let Some(mut remaining) = hex_string_to_int(size_field) else {
+            return Err(Error::new(ErrorKind::InvalidData,"invalid chunk size"))
+        };
+        if remaining == 0 {
+            break;
+        }
+        while remaining > 0 {
+            let want = remaining.min(sink.len() as u64) as usize;
+            match buf_reader.read(&mut sink[..want]).await? {
+                0 => return Err(Error::new(ErrorKind::UnexpectedEof,"chunked body ended mid-chunk")),
+                read => remaining -= read as u64
+            }
+        }
+        //CRLF that closes the chunk data
+        buf_reader.lines().next_line().await?;
+    }
+    //trailer fields, ended by an empty line
+    while let Some(trailer_line) = buf_reader.lines().next_line().await? {
+        if trailer_line.is_empty() {
+            break;
+        }
+    }
+    sink.fill(0);
+    Ok(())
+}
+
 //allow http 1.* & POST, GET, OPTIONS methods
 fn check_is_status_line (line : String) -> bool {
     line.contains("http/1.") && (line.starts_with("get") || line.starts_with("options") || line.starts_with("post"))
 }
 
-#[allow(dead_code)]
 fn hex_string_to_int(hex_string: &str) -> Option<u64> {
     u64::from_str_radix(hex_string, 16).ok()
 }
@@ -423,6 +459,53 @@ mod tests {
         assert!(
             count_occurrences(&out, b"HTTP/1.1 200") >= 1,
             "the final 200 response must still follow the interim 100"
+        );
+    }
+
+    /// A chunked request body must be consumed by its framing and the request answered, with
+    /// the reader left exactly at the end of the body. The old loop read fixed 1024-byte blocks
+    /// with `read_exact`, so it ran past the terminating chunk and swallowed whatever followed
+    /// (against a live peer holding the connection open it blocked there forever instead).
+    #[tokio::test]
+    async fn chunked_body_is_framed_and_the_reader_stops_at_its_end() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"5\r\nhello\r\n");
+        raw.extend_from_slice(b"1a;ext=1\r\nabcdefghijklmnopqrstuvwxyz\r\n");
+        raw.extend_from_slice(b"0\r\n\r\n");
+        raw.extend_from_slice(b"GET /empty HTTP/1.1\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 2,
+            "the chunked POST and the request pipelined behind it must both be answered"
+        );
+    }
+
+    /// Trailer fields after the terminating chunk must be consumed too.
+    #[tokio::test]
+    async fn chunked_body_with_trailers_is_consumed() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"4\r\nping\r\n");
+        raw.extend_from_slice(b"0\r\nX-Checksum: 0\r\n\r\n");
+        raw.extend_from_slice(b"GET /empty HTTP/1.1\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 2,
+            "trailer fields must be consumed before the next request is read"
+        );
+    }
+
+    /// A malformed chunk-size line closes the connection rather than being read as body data.
+    #[tokio::test]
+    async fn malformed_chunk_size_closes_the_connection() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"nonsense\r\nhello\r\n0\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 0,
+            "a body that cannot be framed must not be routed"
         );
     }
 }
