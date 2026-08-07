@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use std::io::Write;
 use indicatif::{ProgressBar, ProgressStyle};
+use log::error;
 use crate::http::request::header_parser;
 use crate::http::tls::setup_tls_connector;
 
@@ -157,10 +158,29 @@ impl HttpClient {
                     let mut buffer = [0; 1024];
                     let mut read_buff = 0;
                     'body_loop:loop {
-                        let n = buf_reader.read(&mut buffer).await.unwrap();
+                        let n = match buf_reader.read(&mut buffer).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                pb.abandon();
+                                error!("Download failed : {e}");
+                                return
+                            }
+                        };
+                        //a read of 0 is end of stream. Without this the loop spins at 100% CPU
+                        //forever whenever the connection ends before `Content-Length` is
+                        //reached, because `read_buff` stops advancing but never reaches it.
+                        if n == 0 {
+                            pb.abandon();
+                            error!("Download ended after {read_buff} of {body_len} bytes");
+                            return
+                        }
                         read_buff += n;
                         pb.set_position(read_buff as u64);
-                        file.write_all(&buffer[..n]).unwrap();
+                        if let Err(e) = file.write_all(&buffer[..n]) {
+                            pb.abandon();
+                            error!("Download write failed : {e}");
+                            return
+                        }
                         if read_buff >= body_len {
                             break 'body_loop;
                         }
@@ -258,6 +278,24 @@ mod tests {
         let body = b"{\"country\":\"US\"}";
         let read = read_response_from(&[head,body]).await;
         assert_eq!(read,[head.as_slice(),body.as_slice()].concat());
+    }
+
+    /// A download that ends before `Content-Length` must stop. The old loop only broke once
+    /// the running count reached `body_len`, so an EOF short of that left it spinning at 100%
+    /// CPU forever. If this regresses the test does not fail, it hangs.
+    #[tokio::test]
+    async fn truncated_download_stops_instead_of_spinning() {
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n");
+        response.extend_from_slice(&vec![b'x'; 512]); //far short of the announced length
+        let mut buf_reader = BufReader::new(std::io::Cursor::new(response));
+        let file_name = std::env::temp_dir().join("librespeed-rs-truncated-download.bin");
+        HttpClient::download_stream(&mut buf_reader,file_name.to_str().unwrap()).await;
+        assert_eq!(
+            std::fs::metadata(&file_name).unwrap().len(),512,
+            "what did arrive is written, and the loop stops at EOF"
+        );
+        let _ = std::fs::remove_file(&file_name);
     }
 
     #[test]
