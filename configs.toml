@@ -20,6 +20,13 @@ assets_path="./assets" # Write without suffix separator
 # password for logging into statistics page, fill this to enable stats page
 stats_password=""
 
+# signing key for stats page session cookies
+# the environment variable LIBRESPEED_STATS_SECRET overrides this value
+# if neither is set, a random key is generated at startup and stats sessions
+# are invalidated whenever the service restarts
+# there is deliberately no command line flag for this: argv is readable via `ps`
+stats_secret_key=""
+
 # redact IP addresses
 redact_ip_addresses=false
 

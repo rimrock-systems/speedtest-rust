@@ -49,6 +49,20 @@ Compatible with all librespeed clients :
 
 [Read full installation methods in wiki](https://github.com/librespeed/speedtest-rust/wiki/Installation)
 
+### Stats page session secret
+
+Stats page logins are held in a signed cookie. The signing key comes from, in order of precedence:
+
+1. the `LIBRESPEED_STATS_SECRET` environment variable
+2. `stats_secret_key` in `configs.toml`
+3. a random key generated at startup, if neither of the above is set
+
+There is no command line flag for the key, because argv is readable by any local user through `ps`.
+
+Leaving the key unset is safe but ephemeral: every restart mints a new key and logs stats users
+out. Set it to a fresh random value (64 characters or so) per deployment to keep sessions alive,
+and never reuse a key that has been published anywhere.
+
 ## Note :
 This project can be much better.\
 Therefore, your PRs are accepted to improve and solve problems
