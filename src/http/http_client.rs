@@ -73,15 +73,7 @@ impl HttpClient {
 
     pub async fn send_request_json(&mut self,packet : &[u8]) -> std::io::Result<Option<Value>> {
         self.stream.write_all(packet).await?;
-        let mut read_data = Vec::new();
-        loop {
-            let mut response = vec![0; 128];
-            let read = self.stream.read(&mut response).await?;
-            read_data.extend(response);
-            if read < 128 { //EOF
-                break;
-            }
-        }
+        let read_data = Self::read_response(&mut self.stream).await?;
         let parser = String::from_utf8_lossy(&read_data);
         let response = parser.trim_matches(char::from(0));
         if response.starts_with("HTTP/1.1 200") {
@@ -95,6 +87,43 @@ impl HttpClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Read a whole HTTP response off `stream`.
+    ///
+    /// A read that returns fewer bytes than the buffer holds is a normal short read, not end
+    /// of stream — over TLS it is the common case — so the loop runs until the announced
+    /// `Content-Length` is satisfied, or until a genuine EOF (`read == 0`) for a response that
+    /// does not announce one. Treating a short read as EOF truncated every response that
+    /// arrived in more than one segment, and the truncated body then failed to parse.
+    async fn read_response<R>(stream : &mut R) -> std::io::Result<Vec<u8>>
+    where
+        R : AsyncReadExt + Unpin
+    {
+        let mut read_data = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let mut body_start = None;
+        let mut content_length = None;
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 { //EOF
+                break;
+            }
+            //only the bytes actually read: the rest of the buffer is padding
+            read_data.extend_from_slice(&buffer[..read]);
+            if body_start.is_none() {
+                body_start = find_subslice(&read_data,b"\r\n\r\n").map(|at| at + 4);
+                if let Some(body_start) = body_start {
+                    content_length = parse_content_length(&read_data[..body_start]);
+                }
+            }
+            if let (Some(body_start),Some(content_length)) = (body_start,content_length) {
+                if read_data.len() >= body_start + content_length {
+                    break;
+                }
+            }
+        }
+        Ok(read_data)
     }
 
     pub async fn download_file(&mut self,file_name : &str) {
@@ -156,4 +185,85 @@ impl HttpClient {
         }
     }
 
+}
+
+fn find_subslice(haystack : &[u8],needle : &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None
+    }
+    (0..=haystack.len() - needle.len()).find(|&at| &haystack[at..at + needle.len()] == needle)
+}
+
+fn parse_content_length(headers : &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .find_map(|line| {
+            let (key,value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case("Content-Length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    async fn read_response_from(segments : &[&[u8]]) -> Vec<u8> {
+        let (mut client,mut server) = duplex(64);
+        let owned : Vec<Vec<u8>> = segments.iter().map(|s| s.to_vec()).collect();
+        let writer = tokio::spawn(async move {
+            for segment in owned {
+                server.write_all(&segment).await.unwrap();
+            }
+            server.shutdown().await.unwrap();
+        });
+        let read = HttpClient::read_response(&mut client).await.unwrap();
+        writer.await.unwrap();
+        read
+    }
+
+    /// A response that arrives in several segments — the normal case over TLS — must be
+    /// assembled whole. The old loop treated any read shorter than its buffer as end of
+    /// stream, so it cut the response short and the JSON body then failed to parse, silently
+    /// disabling the ipinfo lookup.
+    #[tokio::test]
+    async fn multi_segment_response_is_assembled_without_truncation() {
+        let body = format!("{{\"org\":\"AS64500 {}\",\"country\":\"US\"}}","x".repeat(4096));
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",body.len());
+        let read = read_response_from(&[head.as_bytes(),body.as_bytes()]).await;
+        let text = String::from_utf8(read).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200"));
+        let (_,read_body) = text.split_once("\r\n\r\n").unwrap();
+        assert_eq!(read_body,body,"the whole body must be read, not the first segment of it");
+    }
+
+    /// The read must not append the unused tail of its buffer as trailing NUL bytes.
+    #[tokio::test]
+    async fn short_reads_do_not_pad_the_response() {
+        let body = "{\"country\":\"US\"}";
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",body.len());
+        let read = read_response_from(&[head.as_bytes(),body.as_bytes()]).await;
+        assert_eq!(read.len(),head.len() + body.len());
+        assert!(!read.contains(&0),"no NUL padding may be appended");
+    }
+
+    /// A response without `Content-Length` is read to genuine EOF.
+    #[tokio::test]
+    async fn response_without_content_length_is_read_to_eof() {
+        let head = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let body = b"{\"country\":\"US\"}";
+        let read = read_response_from(&[head,body]).await;
+        assert_eq!(read,[head.as_slice(),body.as_slice()].concat());
+    }
+
+    #[test]
+    fn content_length_is_parsed_case_insensitively() {
+        assert_eq!(parse_content_length(b"HTTP/1.1 200 OK\r\ncontent-length: 42\r\n\r\n"),Some(42));
+        assert_eq!(parse_content_length(b"HTTP/1.1 200 OK\r\nContent-Length:7\r\n\r\n"),Some(7));
+        assert_eq!(parse_content_length(b"HTTP/1.1 200 OK\r\n\r\n"),None);
+    }
 }
