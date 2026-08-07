@@ -43,6 +43,11 @@ pub struct ServerConfig {
     pub base_url : String,
     pub ipinfo_api_key : String,
     pub stats_password : String,
+    // Signing key for stats session cookies. Optional in the config file so existing
+    // deployments keep parsing; LIBRESPEED_STATS_SECRET overrides it, and leaving both
+    // unset generates an ephemeral key at startup.
+    #[serde(default)]
+    pub stats_secret_key : String,
     pub redact_ip_addresses : bool,
     pub result_image_theme : String,
     pub assets_path : String,
@@ -66,6 +71,7 @@ impl Default for ServerConfig {
             base_url: "backend".to_string(),
             ipinfo_api_key: "".to_string(),
             stats_password: "".to_string(),
+            stats_secret_key: "".to_string(),
             redact_ip_addresses: false,
             result_image_theme: "light".to_string(),
             assets_path: "".to_string(),

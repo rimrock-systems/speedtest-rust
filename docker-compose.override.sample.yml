@@ -3,6 +3,11 @@ services:
   speedtest:
     container_name: my_speedtest
     restart: unless-stopped
+    environment:
+      # Signing key for stats page session cookies. Overrides stats_secret_key in
+      # configs.toml. Leave it out and a random key is generated at startup, which
+      # logs stats users out on every restart.
+      - LIBRESPEED_STATS_SECRET=change-me-to-a-random-64-char-value
     volumes:
       - "/etc/librespeed.toml:/usr/local/bin/configs.toml"
       - "/var/lib/librespeed/assets:/usr/local/bin/assets"

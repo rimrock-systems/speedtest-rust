@@ -2,6 +2,9 @@ services:
   speedtest:
     build: .
     restart: unless-stopped
+    environment:
+      # signing key for stats page session cookies, overrides stats_secret_key in configs.toml
+      - LIBRESPEED_STATS_SECRET=${LIBRESPEED_STATS_SECRET:-}
     volumes:
       - "/etc/librespeed.toml:/usr/local/bin/configs.toml"
       - "/var/lib/librespeed/assets:/usr/local/bin/assets"
