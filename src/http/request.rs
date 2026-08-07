@@ -167,12 +167,15 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
         if let Err(e) = buf_writer.write_all(&response.data).await {
             trace!("Error socket write : {e}")
         }
-        if response.chunk_count > 0 {
-            for _ in 0..response.chunk_count {
-                if let Err(e) = buf_writer.write_all(GARBAGE_DATA.get().unwrap()).await {
-                    trace!("Error socket write chunk : {e}")
-                }
+        for _ in 0..response.chunk_count {
+            if let Err(e) = buf_writer.write_all(GARBAGE_DATA.get().unwrap()).await {
+                trace!("Error socket write chunk : {e}")
             }
+        }
+        //a response whose headers announce chunked encoding always owes the terminating
+        //zero-length chunk, whatever the chunk count is; skipping it leaves the client
+        //waiting for a body that never ends and the connection unusable for keep-alive
+        if response.chunked {
             if let Err(e) = buf_writer.write_all(b"0\r\n\r\n").await {
                 trace!("Error socket write eof : {e}")
             }
@@ -460,6 +463,12 @@ mod tests {
         Box::pin(async { Response::res_200("") })
     }
 
+    // Router stub for the download endpoint: mirrors `http_server`'s `garbage` route.
+    fn garbage_router(req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let chunk_count = crate::http::get_chunk_count(&req.query_params);
+        Box::pin(async move { Response::res_200_garbage(chunk_count) })
+    }
+
     fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         if needle.is_empty() || haystack.len() < needle.len() { return 0; }
         let mut count = 0;
@@ -476,9 +485,16 @@ mod tests {
     }
 
     async fn drive(raw: Vec<u8>) -> Vec<u8> {
+        drive_with(raw, ok_router).await
+    }
+
+    async fn drive_with<F>(raw: Vec<u8>, router: F) -> Vec<u8>
+    where
+        F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
+    {
         let mut reader = BufReader::new(Cursor::new(raw));
         let mut writer = BufWriter::new(Vec::new());
-        handle_socket("127.0.0.1", &mut reader, &mut writer, ok_router).await;
+        handle_socket("127.0.0.1", &mut reader, &mut writer, router).await;
         writer.flush().await.unwrap();
         writer.into_inner()
     }
@@ -624,6 +640,26 @@ mod tests {
             count_occurrences(&out, b"HTTP/1.1 200"), 0,
             "a body that cannot be framed must not be routed"
         );
+    }
+
+    /// A chunked response must always end with the terminating zero-length chunk, whatever
+    /// chunk count the request asked for. `ckSize=0` used to send the chunked headers, no body
+    /// chunks and no terminator, leaving the client waiting forever on a corrupt stream.
+    #[tokio::test]
+    async fn chunked_response_is_always_terminated() {
+        GARBAGE_DATA.get_or_init(|| b"4\r\n0000\r\n".to_vec());
+        for ck_size in ["0","-1","1"] {
+            let raw = format!("GET /garbage?ckSize={ck_size} HTTP/1.1\r\n\r\n").into_bytes();
+            let out = drive_with(raw, garbage_router).await;
+            assert!(
+                count_occurrences(&out, b"Transfer-Encoding: chunked") == 1,
+                "ckSize={ck_size} must still be a chunked response"
+            );
+            assert!(
+                out.ends_with(b"0\r\n\r\n"),
+                "ckSize={ck_size} must end with the terminating zero-length chunk"
+            );
+        }
     }
 
     /// A form body at or under the ceiling is still parsed and routed normally.

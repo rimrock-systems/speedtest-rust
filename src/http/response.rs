@@ -3,7 +3,10 @@ use crate::http::get_index_file_content;
 #[derive(Debug)]
 pub struct Response {
     pub data : Vec<u8>,
-    pub chunk_count : i32
+    pub chunk_count : i32,
+    /// Set when `data` announces `Transfer-Encoding: chunked`. The terminating zero-length
+    /// chunk is owed for every such response, whatever `chunk_count` turns out to be.
+    pub chunked : bool
 }
 
 impl Response {
@@ -19,7 +22,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(body);
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_400 () -> Self {
@@ -33,7 +36,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(body);
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_200_img (img : &[u8]) -> Self {
@@ -51,7 +54,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(img);
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_200_garbage (chunk_count : i32) -> Self {
@@ -69,7 +72,8 @@ impl Response {
             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n".to_string();
         Response {
             data : response_header.as_bytes().to_vec(),
-            chunk_count
+            chunk_count,
+            chunked : true
         }
     }
 
@@ -129,7 +133,8 @@ impl Response {
             };
             Response {
                 data,
-                chunk_count : 0
+                chunk_count : 0,
+                chunked : false
             }
         } else {
             Self::res_404()
@@ -151,7 +156,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(content.as_bytes());
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_200(content : &str) -> Self {
@@ -167,7 +172,7 @@ impl Response {
             content.len(),
             content
         );
-        Response {data : response_header.as_bytes().to_vec(),chunk_count : 0}
+        Response {data : response_header.as_bytes().to_vec(),chunk_count : 0,chunked : false}
     }
 
     pub fn res_500() -> Self {
@@ -181,7 +186,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(body);
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     /*stats responses*/
@@ -203,7 +208,7 @@ impl Response {
             location
         );
         let data = response_header.as_bytes().to_vec();
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_200_html(content : &str) -> Self {
@@ -222,7 +227,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(content.as_bytes());
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
     pub fn res_403_html(content : &str) -> Self {
@@ -241,7 +246,7 @@ impl Response {
         );
         let mut data = response_header.as_bytes().to_vec();
         data.extend(content.as_bytes());
-        Response {data,chunk_count:0}
+        Response {data,chunk_count:0,chunked:false}
     }
 
 }

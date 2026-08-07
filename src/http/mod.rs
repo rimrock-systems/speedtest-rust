@@ -112,11 +112,10 @@ pub fn get_chunk_count (query_params : &HashMap<String,String>) -> i32 {
     let mut chunks = 4;
     if let Some(ck_size) = query_params.get("ckSize") {
         if let Ok(parsed_ck_size) = ck_size.parse::<i32>() {
-            if parsed_ck_size > 1024 {
-                chunks = 1024
-            } else {
-                chunks = parsed_ck_size
-            }
+            //`ckSize` is client-supplied: clamp it at both ends. Without the lower bound a
+            //zero or negative value yields a chunk count of zero, and the response is sent
+            //with chunked headers and no body at all.
+            chunks = parsed_ck_size.clamp(1,1024)
         }
     }
     chunks *= 2;
@@ -166,5 +165,30 @@ mod tests {
     #[test]
     fn missing_asset_resolves_to_none() {
         assert!(resolve_asset_path("./assets","/no-such-file.js").is_none());
+    }
+
+    fn ck_size(value : &str) -> i32 {
+        let mut query_params = HashMap::new();
+        query_params.insert("ckSize".to_string(),value.to_string());
+        get_chunk_count(&query_params)
+    }
+
+    /// `ckSize` is client-supplied and must be clamped at both ends. Zero and negative values
+    /// used to yield a chunk count of zero or less, producing a chunked response with no body.
+    #[test]
+    fn ck_size_is_clamped_to_at_least_one_chunk() {
+        assert!(ck_size("0") > 0,"ckSize=0 must still produce chunks");
+        assert!(ck_size("-1") > 0,"a negative ckSize must still produce chunks");
+        assert!(ck_size("-2147483648") > 0,"i32::MIN must not underflow into a negative count");
+    }
+
+    /// The existing upper bound and the default are unchanged.
+    #[test]
+    fn ck_size_bounds_are_unchanged() {
+        assert_eq!(ck_size("100"),200);
+        assert_eq!(ck_size("1024"),2048);
+        assert_eq!(ck_size("99999"),2048);
+        assert_eq!(get_chunk_count(&HashMap::new()),8);
+        assert_eq!(ck_size("not-a-number"),8);
     }
 }
