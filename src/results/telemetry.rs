@@ -199,7 +199,11 @@ pub fn draw_result (data : &TelemetryData) -> Vec<u8> {
     //isp_info
     x = unit_padding;
     y = img.height() - (watermark_text_size.1 * 2) - (unit_padding * 5);
-    let isp_info : IPInfo = serde_json::from_str(&data.isp_info).unwrap();
+    // `ispinfo` is stored verbatim from the client's telemetry POST and is never validated at
+    // record time. The bundled web client sends an empty string whenever the ISP lookup did
+    // not run, so an undeserialisable value is ordinary traffic, not just a hostile input:
+    // fall back to an empty `IPInfo` and render a blank ISP line rather than panicking here.
+    let isp_info : IPInfo = serde_json::from_str(&data.isp_info).unwrap_or_default();
     draw_text_mut(&mut img,theme.text_head,x as i32,y as i32,PxScale::from(footer_scale),font,&isp_info.processedString);
     drop(isp_info);
 
@@ -226,4 +230,52 @@ pub fn draw_result (data : &TelemetryData) -> Vec<u8> {
     drop(img);
 
     buffer.into_inner()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+
+    fn init_statics() {
+        FONT.get_or_init(|| FontRef::try_from_slice(include_bytes!("../../assets/open-sans.ttf")).unwrap());
+        SERVER_CONFIG.get_or_init(ServerConfig::default);
+    }
+
+    fn telemetry_with_isp_info(isp_info : &str) -> TelemetryData {
+        TelemetryData {
+            ip_address: "127.0.0.1".to_string(),
+            isp_info: isp_info.to_string(),
+            extra: "".to_string(),
+            user_agent: "".to_string(),
+            lang: "".to_string(),
+            download: "100".to_string(),
+            upload: "50".to_string(),
+            ping: "10".to_string(),
+            jitter: "1".to_string(),
+            log: "".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            timestamp: 0,
+        }
+    }
+
+    /// The bundled web client posts an empty `ispinfo` whenever the ISP lookup did not run, and
+    /// the field is never validated at record time, so the result image must render for any
+    /// stored value. `serde_json::from_str(...).unwrap()` aborted the process here instead.
+    #[test]
+    fn result_image_renders_for_unparseable_isp_info() {
+        init_statics();
+        for isp_info in ["", "x", "{\"processedString\":", "null"] {
+            let image = draw_result(&telemetry_with_isp_info(isp_info));
+            assert!(!image.is_empty(), "result image must render for ispinfo {isp_info:?}");
+        }
+    }
+
+    /// A well-formed `ispinfo` still renders.
+    #[test]
+    fn result_image_renders_for_valid_isp_info() {
+        init_statics();
+        let isp_info = serde_json::to_string(&IPInfo::default()).unwrap();
+        let image = draw_result(&telemetry_with_isp_info(&isp_info));
+        assert!(!image.is_empty());
+    }
 }

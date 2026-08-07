@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use log::trace;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -24,6 +25,17 @@ enum BodyType {
     Chunked,
     Form,
     FormUrlEncoded
+}
+
+/// Upper bound on a form / urlencoded request body. Those bodies are telemetry key-value
+/// pairs a few kilobytes at most, and unlike the upload path they are buffered in memory,
+/// so the announced `Content-Length` must never be trusted as an allocation size.
+const MAX_FORM_BODY_SIZE : u64 = 64 * 1024;
+
+#[derive(Debug)]
+enum BodyError {
+    /// The body could not be read (peer reset, truncated body, unframeable chunks, ...).
+    Io
 }
 
 pub async fn handle_socket<R,W,F>(remote_addr : &str,buf_reader: &mut BufReader<R>,buf_writer : &mut BufWriter<W>,result : F)
@@ -67,51 +79,22 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
                         BodyType::Fixed => {
                             match body_size {
                                 Some(body_size) => {
-                                    // Read and discard exactly `body_size` bytes. The previous loop
-                                    // used `read_exact` into a fixed 1024-byte buffer and added
-                                    // `buffer.len()` (always 1024) per iteration, so a Content-Length
-                                    // that is not a multiple of 1024 left a trailing partial chunk that
-                                    // `read_exact` would block on indefinitely (until the peer
-                                    // disconnects), hanging the upload. Reading with `read` and counting
-                                    // the *actual* bytes returned makes any Content-Length safe and
-                                    // removes the need for client-side payload padding. The larger
-                                    // buffer also cuts the per-1KB read-syscall overhead.
-                                    let mut buffer = [0u8; 65536];
-                                    let mut remaining = body_size as usize;
-                                    while remaining > 0 {
-                                        let want = remaining.min(buffer.len());
-                                        match buf_reader.read(&mut buffer[..want]).await {
-                                            Ok(0) => break,          // peer closed before sending it all
-                                            Ok(n) => remaining -= n, // count what we actually read
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    buffer.fill(0);
-                                    None
+                                    // The upload path streams into a fixed buffer and never
+                                    // buffers the body, so `Content-Length` is not an
+                                    // allocation size here and needs no ceiling.
+                                    discard_body(buf_reader,body_size).await;
+                                    Ok(None)
                                 }
                                 None => {
-                                    None
+                                    Ok(None)
                                 }
                             }
                         }
                         BodyType::Chunked => {
-                            let mut buffer = [0; 1024];
-                            loop {
-                                let bytes_read = buf_reader.read_exact(&mut buffer).await;
-                                match bytes_read {
-                                    Ok(0) => {
-                                        buffer.fill(0);
-                                        break;
-                                    }
-                                    Ok(_) => {
-                                        buffer.fill(0);
-                                    }
-                                    Err(_) => {
-                                        break;
-                                    }
-                                }
+                            match discard_chunked_body(buf_reader).await {
+                                Ok(_) => Ok(None),
+                                Err(_) => Err(BodyError::Io)
                             }
-                            None
                         }
                         BodyType::Form => {
                             let form_boundary = get_content_boundary(parsed_headers.get("Content-Type").unwrap());
@@ -119,42 +102,56 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
                                 Some(form_boundary) => {
                                     match body_size {
                                         Some(body_size) => {
-                                            let mut body = Vec::with_capacity(body_size as usize);
-                                            buf_reader.take(body_size).read_to_end(&mut body).await.unwrap();
-                                            let form_data = parse_form_data(&form_boundary,&body);
-                                            body.fill(0);
-                                            Some(form_data)
+                                            match read_bounded_body(buf_reader,body_size).await {
+                                                Ok(Some(mut body)) => {
+                                                    let form_data = parse_form_data(&form_boundary,&body);
+                                                    body.fill(0);
+                                                    Ok(Some(form_data))
+                                                }
+                                                Ok(None) => Ok(None),
+                                                Err(e) => Err(e)
+                                            }
                                         }
                                         None => {
-                                            None
+                                            Ok(None)
                                         }
                                     }
                                 }
                                 None => {
-                                    None
+                                    Ok(None)
                                 }
                             }
                         }
                         BodyType::FormUrlEncoded => {
                             match body_size {
                                 Some(body_size) => {
-                                    let mut body = Vec::with_capacity(body_size as usize);
-                                    buf_reader.take(body_size).read_to_end(&mut body).await.unwrap();
-                                    let form_data = parse_form_url_encoded(&body);
-                                    body.fill(0);
-                                    Some(form_data)
+                                    match read_bounded_body(buf_reader,body_size).await {
+                                        Ok(Some(mut body)) => {
+                                            let form_data = parse_form_url_encoded(&body);
+                                            body.fill(0);
+                                            Ok(Some(form_data))
+                                        }
+                                        Ok(None) => Ok(None),
+                                        Err(e) => Err(e)
+                                    }
                                 }
                                 None => {
-                                    None
+                                    Ok(None)
                                 }
                             }
                         }
                     }
                 }
                 None => {
-                    None
+                    Ok(None)
                 }
             }
+        };
+        let body_form_data = match body_form_data {
+            Ok(body_form_data) => body_form_data,
+            // Truncated or unframeable body: the stream position is unknown, so the connection
+            // cannot be reused. Close it instead of panicking or answering from a bad position.
+            Err(BodyError::Io) => break 'root_loop
         };
         //trust proxy
         let remote_addr = trust_addr_proxy(&parsed_headers,remote_addr);
@@ -186,12 +183,108 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
     }
 }
 
+/// Consume a `Transfer-Encoding: chunked` request body, following the chunk framing of
+/// RFC 9112 §7.1: a hex chunk-size line (optionally carrying chunk extensions), that many
+/// bytes of data, a CRLF, repeated until a zero-size chunk, then any trailer fields and the
+/// terminating empty line.
+///
+/// The body itself is discarded — no route reads a chunked body — but the framing has to be
+/// followed so the reader stops at the end of the body. Reading fixed-size blocks instead
+/// leaves the request unanswered: the reader waits for bytes that a client which has finished
+/// its body and is holding the connection open will never send.
+async fn discard_chunked_body<R>(buf_reader: &mut BufReader<R>) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin
+{
+    let mut sink = [0u8; 8192];
+    loop {
+        let Some(size_line) = buf_reader.lines().next_line().await? else {
+            return Err(Error::new(ErrorKind::UnexpectedEof,"chunked body ended before its terminating chunk"))
+        };
+        //the chunk-size line may carry `;`-separated chunk extensions
+        let size_field = size_line.split(';').next().unwrap_or("").trim();
+        let Some(mut remaining) = hex_string_to_int(size_field) else {
+            return Err(Error::new(ErrorKind::InvalidData,"invalid chunk size"))
+        };
+        if remaining == 0 {
+            break;
+        }
+        while remaining > 0 {
+            let want = remaining.min(sink.len() as u64) as usize;
+            match buf_reader.read(&mut sink[..want]).await? {
+                0 => return Err(Error::new(ErrorKind::UnexpectedEof,"chunked body ended mid-chunk")),
+                read => remaining -= read as u64
+            }
+        }
+        //CRLF that closes the chunk data
+        buf_reader.lines().next_line().await?;
+    }
+    //trailer fields, ended by an empty line
+    while let Some(trailer_line) = buf_reader.lines().next_line().await? {
+        if trailer_line.is_empty() {
+            break;
+        }
+    }
+    sink.fill(0);
+    Ok(())
+}
+
+/// Read and discard exactly `body_size` bytes, in fixed-size blocks so the memory used does
+/// not depend on the announced `Content-Length`.
+///
+/// An earlier loop used `read_exact` into a fixed 1024-byte buffer and added `buffer.len()`
+/// (always 1024) per iteration, so a `Content-Length` that is not a multiple of 1024 left a
+/// trailing partial chunk that `read_exact` would block on indefinitely, hanging the upload.
+/// Reading with `read` and counting the bytes actually returned makes any `Content-Length`
+/// safe. The larger buffer also cuts the per-1KB read-syscall overhead.
+async fn discard_body<R>(buf_reader: &mut BufReader<R>,body_size : u64)
+where
+    R: AsyncReadExt + Unpin
+{
+    let mut buffer = [0u8; 65536];
+    let mut remaining = body_size;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        match buf_reader.read(&mut buffer[..want]).await {
+            Ok(0) => break,                   // peer closed before sending it all
+            Ok(read) => remaining -= read as u64, // count what we actually read
+            Err(_) => break,
+        }
+    }
+    buffer.fill(0);
+}
+
+/// Read a request body that has to be buffered whole so it can be parsed as form data.
+///
+/// `Content-Length` is client-supplied, so it is checked against `MAX_FORM_BODY_SIZE` *before*
+/// anything is allocated, and the pre-allocation is additionally clamped to that ceiling. A
+/// body over the ceiling is read and discarded in fixed-size blocks rather than buffered, and
+/// the request is handled with no form data — the same outcome as a body that fails to parse.
+///
+/// It is deliberately not answered with 413: this branch is chosen by `Content-Type`, not by
+/// route, so refusing it would also refuse a large upload posted with a form content type.
+/// A short read (peer reset, or a body shorter than announced) is reported instead of
+/// panicking, since the stream position is then unknown.
+async fn read_bounded_body<R>(buf_reader: &mut BufReader<R>,body_size : u64) -> Result<Option<Vec<u8>>,BodyError>
+where
+    R: AsyncReadExt + Unpin
+{
+    if body_size > MAX_FORM_BODY_SIZE {
+        discard_body(buf_reader,body_size).await;
+        return Ok(None)
+    }
+    let mut body = Vec::with_capacity(body_size.min(MAX_FORM_BODY_SIZE) as usize);
+    match buf_reader.take(body_size).read_to_end(&mut body).await {
+        Ok(read) if read as u64 == body_size => Ok(Some(body)),
+        _ => Err(BodyError::Io)
+    }
+}
+
 //allow http 1.* & POST, GET, OPTIONS methods
 fn check_is_status_line (line : String) -> bool {
     line.contains("http/1.") && (line.starts_with("get") || line.starts_with("options") || line.starts_with("post"))
 }
 
-#[allow(dead_code)]
 fn hex_string_to_int(hex_string: &str) -> Option<u64> {
     u64::from_str_radix(hex_string, 16).ok()
 }
@@ -423,6 +516,131 @@ mod tests {
         assert!(
             count_occurrences(&out, b"HTTP/1.1 200") >= 1,
             "the final 200 response must still follow the interim 100"
+        );
+    }
+
+    /// A form body announcing an absurd `Content-Length` must never be pre-allocated. The old
+    /// code called `Vec::with_capacity(content_length)` on the client's word, so a single
+    /// request could ask the allocator for a terabyte. The body is now streamed and discarded,
+    /// so the request is still answered and the process is still standing.
+    #[tokio::test]
+    async fn oversized_form_content_length_is_not_pre_allocated() {
+        for content_type in ["application/x-www-form-urlencoded","multipart/form-data; boundary=zzz"] {
+            let mut raw = format!(
+                "POST /results/telemetry HTTP/1.1\r\n\
+                Content-Type: {content_type}\r\n\
+                Content-Length: 1099511627776\r\n\r\n"
+            ).into_bytes();
+            raw.extend_from_slice(&vec![b'x'; 4096]); //nowhere near the announced length
+            let out = drive(raw).await;
+            assert_eq!(
+                count_occurrences(&out, b"HTTP/1.1 200"), 1,
+                "the request must still be answered for {content_type}"
+            );
+        }
+    }
+
+    /// A large upload posted with a form content type is streamed and discarded like any other
+    /// upload: the body ceiling bounds what is *buffered*, it does not refuse the request. The
+    /// body type is chosen by `Content-Type`, not by route, so refusing here would break
+    /// upload clients that set a form content type on `/empty`.
+    #[tokio::test]
+    async fn large_upload_with_a_form_content_type_is_accepted() {
+        let body = vec![b'x'; 512 * 1024];
+        let mut raw = format!(
+            "POST /empty HTTP/1.1\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\
+            Content-Length: {}\r\n\r\n",
+            body.len()
+        ).into_bytes();
+        raw.extend_from_slice(&body);
+        raw.extend_from_slice(b"GET /empty HTTP/1.1\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 2,
+            "the upload must be answered, and the body consumed exactly so the next request is too"
+        );
+    }
+
+    /// A body that stops short of its announced `Content-Length` (client reset mid-body) must
+    /// close the connection cleanly. The old `read_to_end(...).unwrap()` panicked instead, and
+    /// the release profile turns a panic into a process abort.
+    #[tokio::test]
+    async fn truncated_form_body_does_not_panic() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /results/telemetry HTTP/1.1\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\
+            Content-Length: 512\r\n\r\n");
+        raw.extend_from_slice(b"ispinfo=x"); // far short of the announced 512
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 0,
+            "a truncated body must not be handed to the router as if it were complete"
+        );
+    }
+
+    /// A chunked request body must be consumed by its framing and the request answered, with
+    /// the reader left exactly at the end of the body. The old loop read fixed 1024-byte blocks
+    /// with `read_exact`, so it ran past the terminating chunk and swallowed whatever followed
+    /// (against a live peer holding the connection open it blocked there forever instead).
+    #[tokio::test]
+    async fn chunked_body_is_framed_and_the_reader_stops_at_its_end() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"5\r\nhello\r\n");
+        raw.extend_from_slice(b"1a;ext=1\r\nabcdefghijklmnopqrstuvwxyz\r\n");
+        raw.extend_from_slice(b"0\r\n\r\n");
+        raw.extend_from_slice(b"GET /empty HTTP/1.1\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 2,
+            "the chunked POST and the request pipelined behind it must both be answered"
+        );
+    }
+
+    /// Trailer fields after the terminating chunk must be consumed too.
+    #[tokio::test]
+    async fn chunked_body_with_trailers_is_consumed() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"4\r\nping\r\n");
+        raw.extend_from_slice(b"0\r\nX-Checksum: 0\r\n\r\n");
+        raw.extend_from_slice(b"GET /empty HTTP/1.1\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 2,
+            "trailer fields must be consumed before the next request is read"
+        );
+    }
+
+    /// A malformed chunk-size line closes the connection rather than being read as body data.
+    #[tokio::test]
+    async fn malformed_chunk_size_closes_the_connection() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /empty HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(b"nonsense\r\nhello\r\n0\r\n\r\n");
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 0,
+            "a body that cannot be framed must not be routed"
+        );
+    }
+
+    /// A form body at or under the ceiling is still parsed and routed normally.
+    #[tokio::test]
+    async fn form_body_within_the_ceiling_is_parsed() {
+        let body = "ispinfo=%7B%7D&dl=100";
+        let raw = format!(
+            "POST /results/telemetry HTTP/1.1\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\
+            Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ).into_bytes();
+        let out = drive(raw).await;
+        assert_eq!(
+            count_occurrences(&out, b"HTTP/1.1 200"), 1,
+            "a normal telemetry body must still be accepted"
         );
     }
 }
