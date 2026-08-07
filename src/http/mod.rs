@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use tokio::net::TcpStream;
 use std::fs::File;
 use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use crate::config::{DEF_ASSETS, SERVER_CONFIG};
 
 pub mod http_server;
@@ -48,7 +49,7 @@ pub fn get_index_file_content(file_name : &str) -> Option<Vec<u8>> {
             Some(Vec::from(file.contents()))
         }
     } else {
-        let file_path = format!("{}{}",SERVER_CONFIG.get()?.assets_path,file_name);
+        let file_path = resolve_asset_path(&SERVER_CONFIG.get()?.assets_path,file_name)?;
         if let Ok(mut file) = File::open(file_path) {
             let mut file_bytes = Vec::new();
             if file.read_to_end(&mut file_bytes).is_ok() {
@@ -59,6 +60,28 @@ pub fn get_index_file_content(file_name : &str) -> Option<Vec<u8>> {
         } else {
             None
         }
+    }
+}
+
+/// Resolve a request path against the configured assets directory, returning `None` for
+/// anything that does not stay inside it.
+///
+/// The request path is attacker-controlled and is not normalised anywhere upstream of here,
+/// so joining it onto the assets directory lets `..` segments walk out of that directory and
+/// read files elsewhere on the host. Both sides are canonicalised and compared, which is the
+/// check that actually holds — `res_200_fs`'s extension table is a content-type lookup, not
+/// an access control, and it only incidentally narrows what a traversal can reach.
+fn resolve_asset_path(assets_path : &str,file_name : &str) -> Option<PathBuf> {
+    //belt and braces: a legitimate asset request never contains a `..` segment
+    if Path::new(file_name).components().any(|c| matches!(c,Component::ParentDir)) {
+        return None
+    }
+    let assets_root = std::fs::canonicalize(assets_path).ok()?;
+    let resolved = std::fs::canonicalize(format!("{}{}",assets_path,file_name)).ok()?;
+    if resolved.starts_with(&assets_root) {
+        Some(resolved)
+    } else {
+        None
     }
 }
 
@@ -108,4 +131,40 @@ macro_rules! make_route {
             format!("{}{}",base_url,$a)
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request path that stays inside the assets directory resolves normally.
+    #[test]
+    fn asset_inside_the_root_resolves() {
+        let resolved = resolve_asset_path("./assets","/index.html");
+        assert!(resolved.is_some(),"a normal asset request must resolve");
+        assert!(resolved.unwrap().ends_with("assets/index.html"));
+    }
+
+    /// `..` segments must not walk out of the assets directory. `Cargo.toml` exists one level
+    /// above `./assets`, so an unfixed handler resolves and serves it.
+    #[test]
+    fn traversal_out_of_the_root_is_rejected() {
+        for path in [
+            "/../Cargo.toml",
+            "/../../speedtest-rust/Cargo.toml",
+            "/./../Cargo.toml",
+            "/subdir/../../Cargo.toml",
+        ] {
+            assert!(
+                resolve_asset_path("./assets",path).is_none(),
+                "traversal path {path:?} must be rejected"
+            );
+        }
+    }
+
+    /// A path that does not exist resolves to nothing rather than to something outside.
+    #[test]
+    fn missing_asset_resolves_to_none() {
+        assert!(resolve_asset_path("./assets","/no-such-file.js").is_none());
+    }
 }
