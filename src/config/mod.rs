@@ -39,6 +39,11 @@ impl<T> SetIfSome<T> for Option<T> {
 pub struct ServerConfig {
     pub bind_address : String,
     pub listen_port : u16,
+    /// Peers whose `X-Real-IP` / `X-Forwarded-For` headers are honoured, as IP addresses or
+    /// CIDR ranges. Empty (the default) means forwarded headers are ignored entirely and the
+    /// real peer address is recorded.
+    #[serde(default)]
+    pub trusted_proxies : Vec<String>,
     pub worker_threads: Value,
     pub base_url : String,
     pub ipinfo_api_key : String,
@@ -67,6 +72,7 @@ impl Default for ServerConfig {
         ServerConfig {
             bind_address: "0.0.0.0".to_string(),
             listen_port: 8080,
+            trusted_proxies: Vec::new(),
             worker_threads: Value::from(1),
             base_url: "backend".to_string(),
             ipinfo_api_key: "".to_string(),
@@ -201,6 +207,7 @@ fn initialize (mut config: ServerConfig,cmd : Cmd) -> std::io::Result<()> {
     config.base_url = validate_base_url_path(&config.base_url);
     config.bind_address.set_if_some(cmd.bind_address);
     config.listen_port.set_if_some(cmd.listen_port);
+    config.trusted_proxies.set_if_some(cmd.trusted_proxies);
     config.base_url.set_if_some(cmd.base_url);
     config.ipinfo_api_key.set_if_some(cmd.ipinfo_api_key);
     config.assets_path.set_if_some(cmd.assets_path);

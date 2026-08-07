@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
+use std::net::IpAddr;
 use std::pin::Pin;
 use log::trace;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use case_insensitive_hashmap::CaseInsensitiveHashMap as CIHashMap;
-use crate::config::GARBAGE_DATA;
+use crate::config::{GARBAGE_DATA, SERVER_CONFIG};
 use crate::http::{Method, MethodStr};
 use crate::http::response::Response;
 
@@ -167,12 +168,15 @@ F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
         if let Err(e) = buf_writer.write_all(&response.data).await {
             trace!("Error socket write : {e}")
         }
-        if response.chunk_count > 0 {
-            for _ in 0..response.chunk_count {
-                if let Err(e) = buf_writer.write_all(GARBAGE_DATA.get().unwrap()).await {
-                    trace!("Error socket write chunk : {e}")
-                }
+        for _ in 0..response.chunk_count {
+            if let Err(e) = buf_writer.write_all(GARBAGE_DATA.get().unwrap()).await {
+                trace!("Error socket write chunk : {e}")
             }
+        }
+        //a response whose headers announce chunked encoding always owes the terminating
+        //zero-length chunk, whatever the chunk count is; skipping it leaves the client
+        //waiting for a body that never ends and the connection unusable for keep-alive
+        if response.chunked {
             if let Err(e) = buf_writer.write_all(b"0\r\n\r\n").await {
                 trace!("Error socket write eof : {e}")
             }
@@ -380,13 +384,89 @@ fn clear_path_end_slash(input: &str) -> &str {
 }
 
 fn trust_addr_proxy(headers : &CIHashMap<String>,remote_addr : &str) -> String {
-    headers.get("X-Real-IP")
-        .map(|s| s.as_str())
-        .or_else(|| {
-            headers.get("X-Forwarded-For").and_then(|s| {
-                s.split(',').next().map(|ip| ip.trim())
-            })
-        }).unwrap_or(remote_addr).to_string()
+    let trusted_proxies = SERVER_CONFIG.get()
+        .map(|config| config.trusted_proxies.as_slice())
+        .unwrap_or_default();
+    resolve_client_addr(headers,remote_addr,trusted_proxies)
+}
+
+/// Work out the client address to record for a request.
+///
+/// `X-Real-IP` and `X-Forwarded-For` are set by whoever is on the other end of the socket, so
+/// they are only honoured when the peer is a configured trusted proxy. Otherwise every
+/// recorded address is whatever the client chose to claim. `trusted_proxies` is empty by
+/// default, so out of the box the real peer address is used.
+fn resolve_client_addr(headers : &CIHashMap<String>,remote_addr : &str,trusted_proxies : &[String]) -> String {
+    if !is_trusted_proxy(remote_addr,trusted_proxies) {
+        return remote_addr.to_string()
+    }
+    if let Some(real_ip) = headers.get("X-Real-IP") {
+        let real_ip = real_ip.trim();
+        if real_ip.parse::<IpAddr>().is_ok() {
+            return real_ip.to_string()
+        }
+    }
+    if let Some(forwarded_for) = headers.get("X-Forwarded-For") {
+        let hops : Vec<&str> = forwarded_for.split(',').map(|hop| hop.trim()).collect();
+        //walk back from the hop nearest us: everything to the right was added by a proxy we
+        //trust, so the last entry that is not itself a trusted proxy is the real client
+        let untrusted_hop = hops.iter()
+            .rev()
+            .find(|hop| hop.parse::<IpAddr>().is_ok() && !is_trusted_proxy(hop,trusted_proxies));
+        if let Some(untrusted_hop) = untrusted_hop {
+            return untrusted_hop.to_string()
+        }
+    }
+    remote_addr.to_string()
+}
+
+fn is_trusted_proxy(addr : &str,trusted_proxies : &[String]) -> bool {
+    let Ok(addr) = addr.parse::<IpAddr>() else {
+        return false
+    };
+    trusted_proxies.iter().any(|trusted| addr_matches(&addr,trusted))
+}
+
+/// Match an address against a trusted-proxy entry, which is either a plain IP address or an
+/// address with a CIDR prefix length (`10.0.0.0/8`, `2001:db8::/32`).
+fn addr_matches(addr : &IpAddr,trusted : &str) -> bool {
+    let (network,prefix_len) = match trusted.split_once('/') {
+        Some((network,prefix_len)) => {
+            let Ok(prefix_len) = prefix_len.trim().parse::<u32>() else {
+                return false
+            };
+            (network.trim(),Some(prefix_len))
+        }
+        None => (trusted.trim(),None)
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false
+    };
+    match (addr,network) {
+        (IpAddr::V4(addr),IpAddr::V4(network)) => {
+            prefix_matches(&addr.octets(),&network.octets(),prefix_len.unwrap_or(32))
+        }
+        (IpAddr::V6(addr),IpAddr::V6(network)) => {
+            prefix_matches(&addr.octets(),&network.octets(),prefix_len.unwrap_or(128))
+        }
+        _ => false
+    }
+}
+
+fn prefix_matches(addr : &[u8],network : &[u8],prefix_len : u32) -> bool {
+    if prefix_len as usize > addr.len() * 8 {
+        return false
+    }
+    let whole_bytes = (prefix_len / 8) as usize;
+    if addr[..whole_bytes] != network[..whole_bytes] {
+        return false
+    }
+    let remaining_bits = prefix_len % 8;
+    if remaining_bits == 0 {
+        return true
+    }
+    let mask = 0xffu8 << (8 - remaining_bits);
+    addr[whole_bytes] & mask == network[whole_bytes] & mask
 }
 
 //form-data-parser
@@ -460,6 +540,12 @@ mod tests {
         Box::pin(async { Response::res_200("") })
     }
 
+    // Router stub for the download endpoint: mirrors `http_server`'s `garbage` route.
+    fn garbage_router(req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let chunk_count = crate::http::get_chunk_count(&req.query_params);
+        Box::pin(async move { Response::res_200_garbage(chunk_count) })
+    }
+
     fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         if needle.is_empty() || haystack.len() < needle.len() { return 0; }
         let mut count = 0;
@@ -476,9 +562,16 @@ mod tests {
     }
 
     async fn drive(raw: Vec<u8>) -> Vec<u8> {
+        drive_with(raw, ok_router).await
+    }
+
+    async fn drive_with<F>(raw: Vec<u8>, router: F) -> Vec<u8>
+    where
+        F: Send + Sync + Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
+    {
         let mut reader = BufReader::new(Cursor::new(raw));
         let mut writer = BufWriter::new(Vec::new());
-        handle_socket("127.0.0.1", &mut reader, &mut writer, ok_router).await;
+        handle_socket("127.0.0.1", &mut reader, &mut writer, router).await;
         writer.flush().await.unwrap();
         writer.into_inner()
     }
@@ -624,6 +717,97 @@ mod tests {
             count_occurrences(&out, b"HTTP/1.1 200"), 0,
             "a body that cannot be framed must not be routed"
         );
+    }
+
+    /// A chunked response must always end with the terminating zero-length chunk, whatever
+    /// chunk count the request asked for. `ckSize=0` used to send the chunked headers, no body
+    /// chunks and no terminator, leaving the client waiting forever on a corrupt stream.
+    #[tokio::test]
+    async fn chunked_response_is_always_terminated() {
+        GARBAGE_DATA.get_or_init(|| b"4\r\n0000\r\n".to_vec());
+        for ck_size in ["0","-1","1"] {
+            let raw = format!("GET /garbage?ckSize={ck_size} HTTP/1.1\r\n\r\n").into_bytes();
+            let out = drive_with(raw, garbage_router).await;
+            assert!(
+                count_occurrences(&out, b"Transfer-Encoding: chunked") == 1,
+                "ckSize={ck_size} must still be a chunked response"
+            );
+            assert!(
+                out.ends_with(b"0\r\n\r\n"),
+                "ckSize={ck_size} must end with the terminating zero-length chunk"
+            );
+        }
+    }
+
+    fn headers_with(pairs : &[(&str,&str)]) -> CIHashMap<String> {
+        let mut headers = CIHashMap::new();
+        for (key,value) in pairs {
+            headers.insert(key.to_string(),value.to_string());
+        }
+        headers
+    }
+
+    /// With no trusted proxies configured — the default — the forwarding headers are ignored
+    /// and the real peer address is recorded. Honouring them unconditionally let any client
+    /// choose the address stored against its result and echoed back by `/getIP`.
+    #[test]
+    fn forwarded_headers_are_ignored_from_an_untrusted_peer() {
+        let headers = headers_with(&[("X-Real-IP","9.9.9.9"),("X-Forwarded-For","8.8.8.8")]);
+        assert_eq!(resolve_client_addr(&headers,"203.0.113.7",&[]),"203.0.113.7");
+        let trusted = ["10.0.0.0/8".to_string()];
+        assert_eq!(resolve_client_addr(&headers,"203.0.113.7",&trusted),"203.0.113.7");
+    }
+
+    /// From a trusted proxy the headers are honoured, by exact address and by CIDR range.
+    #[test]
+    fn forwarded_headers_are_honoured_from_a_trusted_peer() {
+        let headers = headers_with(&[("X-Real-IP","9.9.9.9")]);
+        assert_eq!(resolve_client_addr(&headers,"127.0.0.1",&["127.0.0.1".to_string()]),"9.9.9.9");
+        assert_eq!(resolve_client_addr(&headers,"10.1.2.3",&["10.0.0.0/8".to_string()]),"9.9.9.9");
+        assert_eq!(resolve_client_addr(&headers,"::1",&["::1".to_string()]),"9.9.9.9");
+        assert_eq!(resolve_client_addr(&headers,"2001:db8::5",&["2001:db8::/32".to_string()]),"9.9.9.9");
+    }
+
+    /// `X-Forwarded-For` is read from the right: the last hop that is not itself a trusted
+    /// proxy is the client. Taking the first entry lets the client prepend anything it likes.
+    #[test]
+    fn forwarded_for_takes_the_last_untrusted_hop() {
+        let trusted = ["10.0.0.0/8".to_string()];
+        let headers = headers_with(&[("X-Forwarded-For","1.1.1.1, 203.0.113.9, 10.0.0.4")]);
+        assert_eq!(resolve_client_addr(&headers,"10.0.0.5",&trusted),"203.0.113.9");
+    }
+
+    /// A forwarded value that is not an IP address is not recorded.
+    #[test]
+    fn non_ip_forwarded_values_fall_back_to_the_peer() {
+        let trusted = ["127.0.0.1".to_string()];
+        let headers = headers_with(&[("X-Real-IP","notanip"),("X-Forwarded-For","alsonotanip")]);
+        assert_eq!(resolve_client_addr(&headers,"127.0.0.1",&trusted),"127.0.0.1");
+    }
+
+    /// A peer outside the configured range is not trusted.
+    #[test]
+    fn cidr_boundaries_are_respected() {
+        let headers = headers_with(&[("X-Real-IP","9.9.9.9")]);
+        let trusted = ["192.168.1.0/24".to_string()];
+        assert_eq!(resolve_client_addr(&headers,"192.168.1.255",&trusted),"9.9.9.9");
+        assert_eq!(resolve_client_addr(&headers,"192.168.2.1",&trusted),"192.168.2.1");
+        let trusted = ["203.0.113.128/25".to_string()];
+        assert_eq!(resolve_client_addr(&headers,"203.0.113.200",&trusted),"9.9.9.9");
+        assert_eq!(resolve_client_addr(&headers,"203.0.113.127",&trusted),"203.0.113.127");
+    }
+
+    /// A malformed trusted-proxy entry trusts nothing rather than everything.
+    #[test]
+    fn malformed_trusted_entries_trust_nothing() {
+        let headers = headers_with(&[("X-Real-IP","9.9.9.9")]);
+        for entry in ["","/8","10.0.0.0/","10.0.0.0/x","10.0.0.0/99","not-an-address","*"] {
+            let trusted = [entry.to_string()];
+            assert_eq!(
+                resolve_client_addr(&headers,"10.0.0.1",&trusted),"10.0.0.1",
+                "entry {entry:?} must not trust anything"
+            );
+        }
     }
 
     /// A form body at or under the ceiling is still parsed and routed normally.
