@@ -93,7 +93,9 @@ pub fn make_discard_cookie (path : &str) -> String {
 
 pub fn validate_cookie(cookie_data : Option<&String>) -> bool {
     if let Some(cookie_data) = cookie_data {
-        let cookie_parts : HashMap<&str,&str> = cookie_data.split(';').map(|s| s.split_at(s.find('=').unwrap())).map(|(key, val)| (key.trim(), &val[1..])).collect();
+        // A Cookie header segment without '=' is malformed but perfectly sendable,
+        // so skip those rather than indexing past the end of the segment.
+        let cookie_parts : HashMap<&str,&str> = cookie_data.split(';').filter_map(|s| s.split_once('=')).map(|(key, val)| (key.trim(), val)).collect();
         let cookie_token = cookie_parts.get("token").unwrap_or(&"");
         let mut split_token = cookie_token.splitn(3,',');
         let cookie_id = split_token.next().unwrap_or("");
@@ -161,6 +163,17 @@ mod tests {
     fn unparseable_expiry_is_rejected() {
         let header = format!("token=_sessionbad,soon,{}",sign("_sessionbad",0));
         assert!(!validate_cookie(Some(&header)));
+    }
+
+    #[test]
+    fn malformed_cookie_header_is_rejected_not_fatal() {
+        for header in ["junk","junk; token=nonsense","","; ;",";=;"] {
+            assert!(!validate_cookie(Some(&header.to_string())),"header {:?} should be rejected",header);
+        }
+        // a well formed cookie still validates when a malformed segment precedes it
+        let token = make_cookie("/backend/stats").split(';').next().unwrap().to_string();
+        let header = format!("junk; {}",token);
+        assert!(validate_cookie(Some(&header)));
     }
 
     #[test]
